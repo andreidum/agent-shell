@@ -1601,7 +1601,11 @@ COMMAND, when present, may be a shell command string or an argv vector."
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
            ;; Notification is out of context (session/prompt finished).
            ;; Cannot derive where to display, so show in minibuffer.
-           (if (not (agent-shell--active-requests-p state))
+           ;; Allow trailing chunks through when mid-stream, even if active-requests
+           ;; was already cleared (agents may send end_turn and trailing chunks
+           ;; in the same TCP batch).
+           (if (and (not (agent-shell--active-requests-p state))
+                    (not (equal (map-elt state :last-entry-type) "agent_message_chunk")))
                (when acp-logging-enabled
                  (message "Agent message (stale, consider reporting to ACP agent): %s"
                           (truncate-string-to-width (map-nested-elt acp-notification '(params update content text)) 100)))
@@ -4965,22 +4969,28 @@ first-prompt title is left in place."
                       :heartbeat (map-elt agent-shell--state :heartbeat))
                      (unless success
                        (agent-shell--display-pending-requests))
-                     (shell-maker-finish-output :config shell-maker--config
-                                                :success t)
-                     (let ((data (list (cons :stop-reason (map-elt acp-response 'stopReason))
-                                       (cons :usage (map-elt (agent-shell--state) :usage)))))
-                       (agent-shell--emit-event
-                        :event 'turn-complete
-                        :data data)
-                       (agent-shell--start-idle-timer :event 'turn-complete :data data))
-                     ;; Update viewport header (longer busy)
-                     (when-let ((viewport-buffer (agent-shell-viewport--buffer
-                                                  :shell-buffer shell-buffer
-                                                  :existing-only t)))
-                       (with-current-buffer viewport-buffer
-                         (agent-shell-viewport--update-header)))
-                     (when success
-                       (agent-shell--process-pending-request))))
+                     ;; Defer closing the turn so trailing agent_message_chunk
+                     ;; notifications in the same TCP batch are rendered first.
+                     (run-at-time 0 nil
+                                  (lambda ()
+                                    (when-let (((buffer-live-p shell-buffer)))
+                                      (with-current-buffer shell-buffer
+                                        (shell-maker-finish-output :config shell-maker--config
+                                                                   :success t)
+                                        (let ((data (list (cons :stop-reason (map-elt acp-response 'stopReason))
+                                                          (cons :usage (map-elt (agent-shell--state) :usage)))))
+                                          (agent-shell--emit-event
+                                           :event 'turn-complete
+                                           :data data)
+                                          (agent-shell--start-idle-timer :event 'turn-complete :data data))
+                                        ;; Update viewport header (longer busy)
+                                        (when-let ((viewport-buffer (agent-shell-viewport--buffer
+                                                                     :shell-buffer shell-buffer
+                                                                     :existing-only t)))
+                                          (with-current-buffer viewport-buffer
+                                            (agent-shell-viewport--update-header)))
+                                        (when success
+                                          (agent-shell--process-pending-request))))))))
      :on-failure (lambda (acp-error raw-message)
                    ;; Display pending requests on failure.
                    (agent-shell--display-pending-requests)
